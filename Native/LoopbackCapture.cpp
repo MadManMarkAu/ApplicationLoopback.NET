@@ -85,8 +85,6 @@ HRESULT CLoopbackCapture::InitializeLoopbackCapture()
     // Create the capture-stopped event as auto-reset
     RETURN_IF_FAILED(m_hCaptureStopped.create(wil::EventOptions::None));
 
-    std::cout << "Everything ok\n";
-
     return S_OK;
 }
 
