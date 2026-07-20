@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ApplicationLoopback.NET/ApplicationLoopback.NET.csproj" />
+  <Project Path="Sample/Sample.csproj" />
+</Solution>
