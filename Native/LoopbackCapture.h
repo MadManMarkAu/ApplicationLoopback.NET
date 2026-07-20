@@ -14,6 +14,9 @@
 
 using namespace Microsoft::WRL;
 
+typedef void(__stdcall* AudioCallback)(void* instance, const BYTE* data, DWORD length);
+typedef void(__stdcall* AudioEvent)(void* instance);
+
 class CLoopbackCapture :
     public RuntimeClass< RuntimeClassFlags< ClassicCom >, FtmBase, IActivateAudioInterfaceCompletionHandler >
 {
@@ -21,7 +24,8 @@ public:
     CLoopbackCapture() = default;
     ~CLoopbackCapture();
 
-    HRESULT StartCaptureAsync(DWORD processId, bool includeProcessTree, PCWSTR outputFileName);
+    void Initialize(WORD channels, DWORD sampleRate, WORD bitsPerSample, AudioCallback callback, AudioEvent audioCaptureStopped);
+    HRESULT StartCaptureAsync(DWORD processId, bool includeProcessTree);
     HRESULT StopCaptureAsync();
 
     METHODASYNCCALLBACK(CLoopbackCapture, StartCapture, OnStartCapture);
@@ -46,14 +50,19 @@ private:
         Stopped,
     };
 
+    // Capture config
+    WORD channels;
+    DWORD sampleRate;
+    WORD bitsPerSample;
+    AudioCallback audioCallback;
+    AudioEvent audioCaptureStopped;
+
     HRESULT OnStartCapture(IMFAsyncResult* pResult);
     HRESULT OnStopCapture(IMFAsyncResult* pResult);
     HRESULT OnFinishCapture(IMFAsyncResult* pResult);
     HRESULT OnSampleReady(IMFAsyncResult* pResult);
 
     HRESULT InitializeLoopbackCapture();
-    HRESULT CreateWAVFile();
-    HRESULT FixWAVHeader();
     HRESULT OnAudioSampleRequested();
 
     HRESULT ActivateAudioInterface(DWORD processId, bool includeProcessTree);
@@ -69,15 +78,9 @@ private:
 
     wil::unique_event_nothrow m_SampleReadyEvent;
     MFWORKITEM_KEY m_SampleReadyKey = 0;
-    wil::unique_hfile m_hFile;
     wil::critical_section m_CritSec;
     DWORD m_dwQueueID = 0;
-    DWORD m_cbHeaderSize = 0;
-    DWORD m_cbDataSize = 0;
 
-    // These two members are used to communicate between the main thread
-    // and the ActivateCompleted callback.
-    PCWSTR m_outputFileName = nullptr;
     HRESULT m_activateResult = E_UNEXPECTED;
 
     DeviceState m_DeviceState{ DeviceState::Uninitialized };

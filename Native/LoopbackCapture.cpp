@@ -2,10 +2,58 @@
 #include <wchar.h>
 #include <iostream>
 #include <audioclientactivationparams.h>
+#include <functional>
 
 #include "LoopbackCapture.h"
 
 #define BITS_PER_BYTE 8
+
+extern "C" __declspec(dllexport)  ComPtr<CLoopbackCapture>* __stdcall InitializeCapture(WORD channels, DWORD sampleRate, WORD bitsPerSample, 
+    AudioCallback callback, AudioEvent audioCaptureStopped) {
+    ComPtr<CLoopbackCapture>* ptr = new ComPtr<CLoopbackCapture>();
+    HRESULT hr = MakeAndInitialize<CLoopbackCapture>(ptr->GetAddressOf());
+
+    if (FAILED(hr))
+    {
+        delete ptr;
+        return nullptr;
+    }
+
+    (*ptr)->Initialize(channels, sampleRate, bitsPerSample, callback, audioCaptureStopped);
+
+    return ptr;
+}
+
+extern "C" __declspec(dllexport) HRESULT __stdcall StartCaptureAsync(ComPtr<CLoopbackCapture>* loopbackCapture, DWORD processId, bool includeProcessTree) {
+    HRESULT hr = (*loopbackCapture)->StartCaptureAsync(processId, includeProcessTree);
+    if (FAILED(hr))
+    {
+        wil::unique_hlocal_string message;
+        FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_ALLOCATE_BUFFER, nullptr, hr,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (PWSTR)&message, 0, nullptr);
+        std::wcout << L"Failed to start capture\n0x" << std::hex << hr << L": " << message.get() << L"\n\n";
+    }
+
+    return hr;
+}
+
+extern "C" __declspec(dllexport) HRESULT __stdcall StopCaptureAsync(ComPtr<CLoopbackCapture>* instance) {
+    (*instance)->StopCaptureAsync();
+    return S_OK;
+}
+
+extern "C" __declspec(dllexport) void __stdcall FreeCapture(ComPtr<CLoopbackCapture>* instance) {
+    delete instance;
+}
+
+void CLoopbackCapture::Initialize(WORD channels, DWORD sampleRate, WORD bitsPerSample, AudioCallback callback, AudioEvent audioCaptureStopped)
+{
+    this->channels = channels;
+    this->sampleRate = sampleRate;
+    this->bitsPerSample = bitsPerSample;
+    this->audioCallback = callback;
+    this->audioCaptureStopped = audioCaptureStopped;
+}
 
 HRESULT CLoopbackCapture::SetDeviceStateErrorIfFailed(HRESULT hr)
 {
@@ -36,6 +84,8 @@ HRESULT CLoopbackCapture::InitializeLoopbackCapture()
 
     // Create the capture-stopped event as auto-reset
     RETURN_IF_FAILED(m_hCaptureStopped.create(wil::EventOptions::None));
+
+    std::cout << "Everything ok\n";
 
     return S_OK;
 }
@@ -95,18 +145,17 @@ HRESULT CLoopbackCapture::ActivateCompleted(IActivateAudioInterfaceAsyncOperatio
             // The app can also call m_AudioClient->GetMixFormat instead to get the capture format.
             // 16 - bit PCM format.
             m_CaptureFormat.wFormatTag = WAVE_FORMAT_PCM;
-            m_CaptureFormat.nChannels = 2;
-            m_CaptureFormat.nSamplesPerSec = 44100;
-            m_CaptureFormat.wBitsPerSample = 16;
+            m_CaptureFormat.nChannels = this->channels;
+            m_CaptureFormat.nSamplesPerSec = this->sampleRate;;
+            m_CaptureFormat.wBitsPerSample = this->bitsPerSample;
             m_CaptureFormat.nBlockAlign = m_CaptureFormat.nChannels * m_CaptureFormat.wBitsPerSample / BITS_PER_BYTE;
             m_CaptureFormat.nAvgBytesPerSec = m_CaptureFormat.nSamplesPerSec * m_CaptureFormat.nBlockAlign;
 
-            // Initialize the AudioClient in Shared Mode
+            // Initialize the AudioClient in Shared Mode with the user specified buffer
             RETURN_IF_FAILED(m_AudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-                /* | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY // for better resampling quality */,
-                0,
-                0,
+                AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                200000,
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
                 &m_CaptureFormat,
                 nullptr));
 
@@ -122,9 +171,6 @@ HRESULT CLoopbackCapture::ActivateCompleted(IActivateAudioInterfaceAsyncOperatio
             // Tell the system which event handle it should signal when an audio buffer is ready to be processed by the client
             RETURN_IF_FAILED(m_AudioClient->SetEventHandle(m_SampleReadyEvent.get()));
 
-            // Creates the WAV file.
-            RETURN_IF_FAILED(CreateWAVFile());
-
             // Everything is ready.
             m_DeviceState = DeviceState::Initialized;
 
@@ -136,79 +182,8 @@ HRESULT CLoopbackCapture::ActivateCompleted(IActivateAudioInterfaceAsyncOperatio
     return S_OK;
 }
 
-//
-//  CreateWAVFile()
-//
-//  Creates a WAV file in music folder
-//
-HRESULT CLoopbackCapture::CreateWAVFile()
+HRESULT CLoopbackCapture::StartCaptureAsync(DWORD processId, bool includeProcessTree)
 {
-    return SetDeviceStateErrorIfFailed([&]()->HRESULT
-        {
-            m_hFile.reset(CreateFile(m_outputFileName, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
-            RETURN_LAST_ERROR_IF(!m_hFile);
-
-            // Create and write the WAV header
-
-                // 1. RIFF chunk descriptor
-            DWORD header[] = {
-                                FCC('RIFF'),        // RIFF header
-                                0,                  // Total size of WAV (will be filled in later)
-                                FCC('WAVE'),        // WAVE FourCC
-                                FCC('fmt '),        // Start of 'fmt ' chunk
-                                sizeof(m_CaptureFormat) // Size of fmt chunk
-            };
-            DWORD dwBytesWritten = 0;
-            RETURN_IF_WIN32_BOOL_FALSE(WriteFile(m_hFile.get(), header, sizeof(header), &dwBytesWritten, NULL));
-
-            m_cbHeaderSize += dwBytesWritten;
-
-            // 2. The fmt sub-chunk
-            WI_ASSERT(m_CaptureFormat.cbSize == 0);
-            RETURN_IF_WIN32_BOOL_FALSE(WriteFile(m_hFile.get(), &m_CaptureFormat, sizeof(m_CaptureFormat), &dwBytesWritten, NULL));
-            m_cbHeaderSize += dwBytesWritten;
-
-            // 3. The data sub-chunk
-            DWORD data[] = { FCC('data'), 0 };  // Start of 'data' chunk
-            RETURN_IF_WIN32_BOOL_FALSE(WriteFile(m_hFile.get(), data, sizeof(data), &dwBytesWritten, NULL));
-            m_cbHeaderSize += dwBytesWritten;
-
-            return S_OK;
-        }());
-}
-
-
-//
-//  FixWAVHeader()
-//
-//  The size values were not known when we originally wrote the header, so now go through and fix the values
-//
-HRESULT CLoopbackCapture::FixWAVHeader()
-{
-    // Write the size of the 'data' chunk first
-    DWORD dwPtr = SetFilePointer(m_hFile.get(), m_cbHeaderSize - sizeof(DWORD), NULL, FILE_BEGIN);
-    RETURN_LAST_ERROR_IF(INVALID_SET_FILE_POINTER == dwPtr);
-
-    DWORD dwBytesWritten = 0;
-    RETURN_IF_WIN32_BOOL_FALSE(WriteFile(m_hFile.get(), &m_cbDataSize, sizeof(DWORD), &dwBytesWritten, NULL));
-
-    // Write the total file size, minus RIFF chunk and size
-    // sizeof(DWORD) == sizeof(FOURCC)
-    RETURN_LAST_ERROR_IF(INVALID_SET_FILE_POINTER == SetFilePointer(m_hFile.get(), sizeof(DWORD), NULL, FILE_BEGIN));
-
-    DWORD cbTotalSize = m_cbDataSize + m_cbHeaderSize - 8;
-    RETURN_IF_WIN32_BOOL_FALSE(WriteFile(m_hFile.get(), &cbTotalSize, sizeof(DWORD), &dwBytesWritten, NULL));
-
-    RETURN_IF_WIN32_BOOL_FALSE(FlushFileBuffers(m_hFile.get()));
-
-    return S_OK;
-}
-
-HRESULT CLoopbackCapture::StartCaptureAsync(DWORD processId, bool includeProcessTree, PCWSTR outputFileName)
-{
-    m_outputFileName = outputFileName;
-    auto resetOutputFileName = wil::scope_exit([&] { m_outputFileName = nullptr; });
-
     RETURN_IF_FAILED(InitializeLoopbackCapture());
     RETURN_IF_FAILED(ActivateAudioInterface(processId, includeProcessTree));
 
@@ -216,6 +191,7 @@ HRESULT CLoopbackCapture::StartCaptureAsync(DWORD processId, bool includeProcess
     if (m_DeviceState == DeviceState::Initialized)
     {
         m_DeviceState = DeviceState::Starting;
+
         return MFPutWorkItem2(MFASYNC_CALLBACK_QUEUE_MULTITHREADED, 0, &m_xStartCapture, nullptr);
     }
 
@@ -286,7 +262,6 @@ HRESULT CLoopbackCapture::OnStopCapture(IMFAsyncResult* pResult)
 //
 //  FinishCaptureAsync()
 //
-//  Finalizes WAV file on a separate thread via MF Work Item
 //
 HRESULT CLoopbackCapture::FinishCaptureAsync()
 {
@@ -298,16 +273,19 @@ HRESULT CLoopbackCapture::FinishCaptureAsync()
 //  OnFinishCapture()
 //
 //  Because of the asynchronous nature of the MF Work Queues and the DataWriter, there could still be
-//  a sample processing.  So this will get called to finalize the WAV header.
+//  a sample processing.
 //
 HRESULT CLoopbackCapture::OnFinishCapture(IMFAsyncResult* pResult)
 {
-    // FixWAVHeader will set the DeviceStateStopped when all async tasks are complete
-    HRESULT hr = FixWAVHeader();
+    HRESULT hr = S_OK;
 
     m_DeviceState = DeviceState::Stopped;
 
     m_hCaptureStopped.SetEvent();
+
+    // Export the event when the capture stops
+    if (this->audioCaptureStopped)
+        this->audioCaptureStopped(this);
 
     return hr;
 }
@@ -383,35 +361,18 @@ HRESULT CLoopbackCapture::OnAudioSampleRequested()
     {
         cbBytesToCapture = FramesAvailable * m_CaptureFormat.nBlockAlign;
 
-        // WAV files have a 4GB (0xFFFFFFFF) size limit, so likely we have hit that limit when we
-        // overflow here.  Time to stop the capture
-        if ((m_cbDataSize + cbBytesToCapture) < m_cbDataSize)
-        {
-            StopCaptureAsync();
-            break;
-        }
-
         // Get sample buffer
         RETURN_IF_FAILED(m_AudioCaptureClient->GetBuffer(&Data, &FramesAvailable, &dwCaptureFlags, &u64DevicePosition, &u64QPCPosition));
 
-
-        // Write File
+        // Trigger the callback
         if (m_DeviceState != DeviceState::Stopping)
         {
-            DWORD dwBytesWritten = 0;
-            RETURN_IF_WIN32_BOOL_FALSE(WriteFile(
-                m_hFile.get(),
-                Data,
-                cbBytesToCapture,
-                &dwBytesWritten,
-                NULL));
+            if (this->audioCallback)
+                this->audioCallback(this, Data, cbBytesToCapture);
         }
 
         // Release buffer back
         m_AudioCaptureClient->ReleaseBuffer(FramesAvailable);
-
-        // Increase the size of our 'data' chunk.  m_cbDataSize needs to be accurate
-        m_cbDataSize += cbBytesToCapture;
     }
 
     return S_OK;
