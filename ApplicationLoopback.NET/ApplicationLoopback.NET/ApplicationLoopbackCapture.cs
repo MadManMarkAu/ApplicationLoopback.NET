@@ -25,12 +25,18 @@ namespace ApplicationLoopback.NET
         public event AudioDataHandler NewDataAvailable;
         public event AudioEventHandler CaptureStopped;
 
+        AudioCallback _onData;
+        AudioEvent _onCaptureStopped;
+
         public ApplicationLoopbackCapture(int channels, int sampleRate)
         {
             this.Channels = channels;
             this.SampleRate = sampleRate;
 
-            _capture = Native.InitializeCapture((ushort)Channels, (uint)SampleRate, 16, OnData, OnCaptureStopped);
+            _onData = OnData;
+            _onCaptureStopped = OnCaptureStopped;
+
+            _capture = Native.InitializeCapture((ushort)Channels, (uint)SampleRate, 16, _onData, _onCaptureStopped);
 
             if (_capture == IntPtr.Zero)
                 throw new Exception($"Failed to initialize capture");
